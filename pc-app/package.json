@@ -1,0 +1,15 @@
+{
+  "name": "remote-terminal-pc",
+  "version": "1.0.0",
+  "description": "PC desktop app for remote terminal",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "electron": "^29.0.0"
+  }
+}

@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Remote Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #000;
+      color: #fff;
+      font-family: monospace;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 12px;
+      background: #111;
+      border-bottom: 1px solid #222;
+      flex-shrink: 0;
+      font-size: 12px;
+      color: #aaa;
+      gap: 8px;
+    }
+
+    #header .title { font-weight: bold; color: #fff; }
+
+    #status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+    #status-dot.connected { background: #4caf50; }
+    #status-dot.waiting   { background: #ff9800; }
+    #status-dot.error     { background: #f44336; }
+
+    #status-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    #reconnect-btn {
+      display: none;
+      padding: 4px 10px;
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #reconnect-btn:hover { background: #444; }
+
+    #terminal-container {
+      flex: 1;
+      overflow: hidden;
+      padding: 4px;
+    }
+
+    /* Token setup overlay */
+    #token-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.92);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 24px;
+    }
+
+    #token-box {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 24px;
+      width: 100%;
+      max-width: 380px;
+    }
+
+    #token-box h2 { font-size: 16px; margin-bottom: 8px; }
+    #token-box p  { font-size: 12px; color: #888; margin-bottom: 16px; line-height: 1.4; }
+
+    #token-input {
+      width: 100%;
+      padding: 10px;
+      background: #111;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 14px;
+      font-family: monospace;
+      margin-bottom: 12px;
+    }
+
+    #token-input:focus { outline: none; border-color: #666; }
+
+    #token-submit {
+      width: 100%;
+      padding: 10px;
+      background: #2d6a4f;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    #token-submit:hover { background: #3a8a64; }
+
+    #token-error { color: #f44336; font-size: 12px; margin-top: 8px; display: none; }
+  </style>
+</head>
+<body>
+
+  <!-- Token setup overlay (shown on first visit or if token not set) -->
+  <div id="token-overlay">
+    <div id="token-box">
+      <h2>Remote Terminal</h2>
+      <p>Enter your AGENT_TOKEN to connect. This is stored locally in your browser and never sent to any third party.</p>
+      <input id="token-input" type="password" placeholder="Paste your token here…" autocomplete="off" spellcheck="false" />
+      <button id="token-submit">Connect</button>
+      <div id="token-error">Token cannot be empty.</div>
+    </div>
+  </div>
+
+  <div id="header">
+    <span class="title">Remote Terminal</span>
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
+    <button id="reconnect-btn">Reconnect</button>
+  </div>
+
+  <div id="terminal-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script>
+    (function () {
+      'use strict';
+
+      // ── Token handling ─────────────────────────────────────────────────────
+      var TOKEN_KEY = 'remote-terminal-token';
+      var overlay    = document.getElementById('token-overlay');
+      var tokenInput = document.getElementById('token-input');
+      var tokenSubmit= document.getElementById('token-submit');
+      var tokenError = document.getElementById('token-error');
+
+      var statusDot  = document.getElementById('status-dot');
+      var statusText = document.getElementById('status-text');
+      var reconnectBtn = document.getElementById('reconnect-btn');
+
+      function getStoredToken() {
+        return localStorage.getItem(TOKEN_KEY) || '';
+      }
+
+      function saveToken(t) {
+        localStorage.setItem(TOKEN_KEY, t);
+      }
+
+      function showOverlay() {
+        overlay.style.display = 'flex';
+        tokenInput.value = '';
+        setTimeout(function () { tokenInput.focus(); }, 50);
+      }
+
+      function hideOverlay() {
+        overlay.style.display = 'none';
+      }
+
+      tokenSubmit.addEventListener('click', function () {
+        var t = tokenInput.value.trim();
+        if (!t) { tokenError.style.display = 'block'; return; }
+        tokenError.style.display = 'none';
+        saveToken(t);
+        hideOverlay();
+        initTerminal(t);
+      });
+
+      tokenInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') tokenSubmit.click();
+      });
+
+      // ── Terminal ──────────────────────────────────────────────────────────
+      var term = null;
+      var fitAddon = null;
+      var ws = null;
+      var reconnectTimer = null;
+      var currentToken = null;
+
+      function setStatus(dotClass, text, showReconnect) {
+        statusDot.className = dotClass || '';
+        statusText.textContent = text || '';
+        reconnectBtn.style.display = showReconnect ? 'inline-block' : 'none';
+      }
+
+      function buildWsUrl(token) {
+        var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        return proto + '://' + location.host + '/ws/browser?token=' + encodeURIComponent(token);
+      }
+
+      function connect(token) {
+        if (ws) {
+          ws.onclose = null;
+          ws.onerror = null;
+          try { ws.close(); } catch (_) {}
+          ws = null;
+        }
+        clearTimeout(reconnectTimer);
+
+        setStatus('waiting', 'Connecting…', false);
+
+        var socket = new WebSocket(buildWsUrl(token));
+        socket.binaryType = 'arraybuffer';
+        ws = socket;
+
+        socket.onopen = function () {
+          setStatus('connected', 'Connected', false);
+        };
+
+        socket.onmessage = function (evt) {
+          // Check if it's a JSON status message
+          var raw = evt.data;
+          if (typeof raw === 'string') {
+            try {
+              var msg = JSON.parse(raw);
+              if (msg.type === 'status') {
+                var connected = msg.message && msg.message.toLowerCase().includes('ready');
+                setStatus(connected ? 'connected' : 'waiting', msg.message, false);
+                if (!connected) {
+                  term.write('\r\n\x1b[33m[relay] ' + msg.message + '\x1b[0m\r\n');
+                }
+                return;
+              }
+            } catch (_) {}
+            // Plain text terminal data
+            term.write(raw);
+          } else {
+            // Binary data
+            term.write(new Uint8Array(raw));
+          }
+        };
+
+        socket.onclose = function (evt) {
+          if (ws !== socket) return; // superseded
+          setStatus('error', 'Disconnected', true);
+          term.write('\r\n\x1b[31m[relay] WebSocket closed. Use "Reconnect" or wait…\x1b[0m\r\n');
+        };
+
+        socket.onerror = function () {
+          if (ws !== socket) return;
+          setStatus('error', 'Connection error', true);
+        };
+      }
+
+      function sendResize() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        var msg = JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows });
+        try { ws.send(msg); } catch (_) {}
+      }
+
+      function initTerminal(token) {
+        currentToken = token;
+
+        if (!term) {
+          term = new Terminal({
+            cursorBlink: true,
+            fontSize: 13,
+            fontFamily: 'Menlo, Consolas, "Courier New", monospace',
+            theme: {
+              background: '#000000',
+              foreground: '#cccccc',
+              cursor:     '#ffffff',
+              black:      '#000000',
+              red:        '#cc0000',
+              green:      '#4e9a06',
+              yellow:     '#c4a000',
+              blue:       '#3465a4',
+              magenta:    '#75507b',
+              cyan:       '#06989a',
+              white:      '#d3d7cf',
+              brightBlack:  '#555753',
+              brightRed:    '#ef2929',
+              brightGreen:  '#8ae234',
+              brightYellow: '#fce94f',
+              brightBlue:   '#729fcf',
+              brightMagenta:'#ad7fa8',
+              brightCyan:   '#34e2e2',
+              brightWhite:  '#eeeeec'
+            }
+          });
+
+          fitAddon = new FitAddon.FitAddon();
+          term.loadAddon(fitAddon);
+          term.open(document.getElementById('terminal-container'));
+          fitAddon.fit();
+
+          // Send keystrokes to relay
+          term.onData(function (data) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              try { ws.send(data); } catch (_) {}
+            }
+          });
+
+          // Resize handling
+          var resizeObserver = new ResizeObserver(function () {
+            fitAddon.fit();
+            sendResize();
+          });
+          resizeObserver.observe(document.getElementById('terminal-container'));
+
+          window.addEventListener('orientationchange', function () {
+            setTimeout(function () { fitAddon.fit(); sendResize(); }, 300);
+          });
+        }
+
+        connect(token);
+      }
+
+      // Reconnect button
+      reconnectBtn.addEventListener('click', function () {
+        if (currentToken) connect(currentToken);
+      });
+
+      // ── Startup ───────────────────────────────────────────────────────────
+      var saved = getStoredToken();
+      if (saved) {
+        hideOverlay();
+        initTerminal(saved);
+      } else {
+        showOverlay();
+      }
+
+    })();
+  </script>
+</body>
+</html>
